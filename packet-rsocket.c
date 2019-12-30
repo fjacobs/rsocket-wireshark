@@ -66,10 +66,17 @@ static int hf_rsocket_follows_flag = -1;
 static int hf_rsocket_complete_flag = -1;
 static int hf_rsocket_next_flag = -1;
 static int hf_rsocket_respond_flag = -1;
+
 static int hf_rsocket_composite_metadata_ext_flag = -1;
+static int hf_rsocket_composite_metadata_m_flag = -1;
+static int hf_rsocket_composite_meta_mime_id = -1;
+static int hf_rsocket_composite_meta_encoding_mime_type = -1;
+static int hf_rsocket_composite_meta_length = -1;
+static int hf_rsocket_composite_meta_payload = -1;
 
 static gint ett_rsocket = -1;
 static gint ett_rframe = -1;
+static gint ett_compExt = -1;
 
 static gint frame_len_field_size = 3;
 
@@ -103,19 +110,25 @@ static const value_string errorCodeNames[] = {
     {0x00000202, "REJECTED"},          {0x00000203, "CANCELED"},
     {0x00000204, "INVALID"},           {0xFFFFFFFF, "REJECTED"}};
 
-static const value_string mimeTypeIds[] = {
-        {  0x7E, "message/x.rsocket.routing.v0 " },
-        {  0,       NULL }
+
+static const value_string m_flag_true_false[] ={
+    {0x01, "Set"},
+    {0x00, "Not set"}
 };
 
-typedef enum composite_metadata_extension {
-    COMPOSITE_METADATA_EXTENSION = 0
+static const value_string mimeTypeIds[] = {
+    {  0x7E, "message/x.rsocket.routing.v0" },
+    {  0,       NULL }
+};
+
+typedef enum setup_state {
+  COMPOSITE_METADATA_EXTENSION = 0
 } comp_meta_t;
 
-/* this is a guide to the current conversation state */
 struct rsocket_conversation_data {
-    comp_meta_t state;
+  comp_meta_t state;
 };
+
 
 static const gchar *getFrameTypeName(const guint64 frame_type) {
   for (unsigned long i = 0; i < sizeof(frameTypeNames) / sizeof(value_string);
@@ -170,24 +183,23 @@ static gint read_rsocket_setup_frame(packet_info *pinfo, proto_tree *tree, tvbuf
   proto_tree_add_item(tree, hf_rsocket_mdata_mime_type, tvb, offset,
                       mdata_mime_length, ENC_BIG_ENDIAN);
 
-    guint8 *param_name = tvb_get_string_enc(wmem_packet_scope(), tvb, offset,
-                                            mdata_mime_length,
-                                            ENC_UTF_8|ENC_NA);
+  guint8 *param_name = tvb_get_string_enc(wmem_packet_scope(), tvb, offset,
+                                          mdata_mime_length,ENC_UTF_8|ENC_NA);
 
-   if( !strcmp(param_name, "message/x.rsocket.composite-metadata.v0") ) {
-       g_warning("Found composite metadata = %s !!!!!", param_name);
-       //Remember this for the next initialisation frame..
-       struct conversation* convo =  conversation_new(0, &pinfo->src, NULL, ENDPOINT_TCP, 9897, 0, NO_ADDR2 );
+  if( !strcmp(param_name, "message/x.rsocket.composite-metadata.v0") ) {
 
-       struct rsocket_conversation_data	*conversation_data;
-       conversation_data = conversation_get_proto_data(convo, proto_rsocket);
+    struct conversation* convo =  conversation_new(0, &pinfo->src, NULL,
+                                                   ENDPOINT_TCP, 9897, 0, NO_ADDR2 );
+    struct rsocket_conversation_data *conversation_data;
 
-       if (conversation_data == NULL) {
-           conversation_data = g_malloc(sizeof(struct rsocket_conversation_data));
-           conversation_data->state = COMPOSITE_METADATA_EXTENSION;
-           conversation_add_proto_data(convo, proto_rsocket, conversation_data);
-       }
-   }
+    conversation_data = conversation_get_proto_data(convo, proto_rsocket);
+
+    if (conversation_data == NULL) {
+      conversation_data = g_malloc(sizeof(struct rsocket_conversation_data));
+      conversation_data->state = COMPOSITE_METADATA_EXTENSION;
+      conversation_add_proto_data(convo, proto_rsocket, conversation_data);
+    }
+  }
 
   offset += mdata_mime_length;
 
@@ -311,12 +323,12 @@ static int dissect_rsocket(tvbuff_t *tvb, packet_info *pinfo,
 
 static int frame_length_field_dissector(tvbuff_t *tvb, packet_info *pinfo,
                                         proto_tree *tree, void *data _U_) {
-    return dissect_rsocket(tvb, pinfo, tree, frame_len_field_size);
+  return dissect_rsocket(tvb, pinfo, tree, frame_len_field_size);
 }
 
 static int no_frame_length_field_dissector(tvbuff_t *tvb, packet_info *pinfo,
                                            proto_tree *tree, void *data _U_) {
-    return dissect_rsocket(tvb, pinfo, tree, 0);
+  return dissect_rsocket(tvb, pinfo, tree, 0);
 }
 
 static int dissect_rsocket(tvbuff_t *tvb, packet_info *pinfo,
@@ -368,7 +380,7 @@ static int dissect_rsocket(tvbuff_t *tvb, packet_info *pinfo,
     col_add_str(pinfo->cinfo, COL_INFO, "UNDEFINED");
   }
 
-  //Indicates a frame type that initiates interactions (TODO: refactor)
+  //Indicates a frame type that initiates interactions (TODO: refactor into conversation)
   gboolean initialization_frame_flag = FALSE;
 
   if (frame_type == 0x01) {
@@ -377,16 +389,16 @@ static int dissect_rsocket(tvbuff_t *tvb, packet_info *pinfo,
     offset = read_rsocket_keepalive_frame(rframe_tree, tvb, offset);
   } else if (frame_type == 0x04) {
     offset = read_rsocket_req_resp_frame(rframe_tree, tvb, offset);
-      initialization_frame_flag = TRUE;
+    initialization_frame_flag = TRUE;
   } else if (frame_type == 0x05) {
     offset = read_rsocket_fnf_frame(rframe_tree, tvb, offset);
-      initialization_frame_flag = TRUE;
+    initialization_frame_flag = TRUE;
   } else if (frame_type == 0x06) {
     offset = read_rsocket_req_stream_frame(pinfo, rframe_tree, tvb, offset);
-      initialization_frame_flag = TRUE;
+    initialization_frame_flag = TRUE;
   } else if (frame_type == 0x07) {
     offset = read_rsocket_req_channel_frame(rframe_tree, tvb, offset);
-      initialization_frame_flag = TRUE;
+    initialization_frame_flag = TRUE;
   } else if (frame_type == 0x08) {
     offset = read_rsocket_req_n_frame(pinfo, rframe_tree, tvb, offset);
   } else if (frame_type == 0x09) {
@@ -403,29 +415,52 @@ static int dissect_rsocket(tvbuff_t *tvb, packet_info *pinfo,
     guint32 mdata_len;
     proto_tree_add_item_ret_uint(rframe_tree, hf_rsocket_mdata_len, tvb, offset,
                                  3, ENC_BIG_ENDIAN, &mdata_len);
+    offset += 3;
+    //TODO: get port from pinfo
+    struct conversation  *convo = find_conversation(0, &pinfo->src, NULL, ENDPOINT_TCP,
+                                                    9897, 0, NO_ADDR2);
 
-    struct conversation  *convo = find_conversation(0, &pinfo->src, NULL, ENDPOINT_TCP, 9897, 0, NO_ADDR2);
     struct rsocket_conversation_data *conversation_data;
-
     conversation_data = conversation_get_proto_data(convo, proto_rsocket);
 
-    if( (mdata_len!=0) && (initialization_frame_flag) && (conversation_data->state == COMPOSITE_METADATA_EXTENSION  ) )
-    { // then dissect: hf_rsocket_composite_metadata_ext_flag
-      g_warning("Found composite metadata extension");
-      //TODO: Dissect Composite metadata
-      // proto_tree_add_item(rframe_tree, hf_rsocket_composite_metadata_ext_flag, tvb, offset, 1, ENC_BIG_ENDIAN);
-      // conversation_delete_proto_data(convo, proto_rsocket);
+    if( (mdata_len!=0) && (initialization_frame_flag) && (conversation_data->state == COMPOSITE_METADATA_EXTENSION  ) ) {
+      conversation_delete_proto_data(convo, proto_rsocket);
+      g_free(conversation_data);
+
+      proto_item *compExt;
+      proto_tree *compExt_tree = proto_tree_add_subtree(
+          rframe_tree, tvb, offset, mdata_len, ett_compExt, &compExt, "Composite Metadata Extension");
+
+      guint32 val;
+      proto_tree_add_item_ret_uint(compExt_tree, hf_rsocket_composite_metadata_m_flag,
+                                   tvb, offset,1, ENC_BIG_ENDIAN, &val);
+      proto_tree_add_item(compExt_tree, hf_rsocket_composite_meta_mime_id, tvb, offset,1, ENC_NA);
+      offset+=4;
+      guint32 mPayloadLength;
+      proto_tree_add_item_ret_uint(compExt_tree, hf_rsocket_composite_meta_length, tvb, offset,
+                                   1, ENC_BIG_ENDIAN, &mPayloadLength);
+      offset += 1;
+      proto_tree_add_item(compExt_tree, hf_rsocket_composite_meta_payload, tvb, offset, mPayloadLength, ENC_BIG_ENDIAN);
+      offset -= 5;
     } else {
-        g_warning("Dit not find compose extension");
-        offset += 3;
-        proto_tree_add_item(rframe_tree, hf_rsocket_mdata, tvb, offset, mdata_len,
-                            ENC_BIG_ENDIAN);
+      offset += 3;
+      proto_tree_add_item(rframe_tree, hf_rsocket_mdata, tvb, offset, mdata_len, ENC_BIG_ENDIAN);
     }
     offset += mdata_len;
     col_append_fstr(pinfo->cinfo, COL_INFO, " MetadataLen=%d", mdata_len);
   }
 
+
   guint32 data_len = frame_len + frame_length_field_size - offset;
+
+  g_warning("\n\n\n-----------------------------------------------------");
+  g_warning("initialization_frame_flag: %i\n", initialization_frame_flag);
+  g_warning("---------framelen: %i", frame_len);
+  g_warning("---------frame_length_field_size: %i", frame_length_field_size);
+  g_warning("---------offset: %i", offset);
+  g_warning("data_len: %i", data_len);
+  g_warning("-----------------------------------------------------\n\n\n");
+
   if (data_len > 0) {
     proto_tree_add_item(rframe_tree, hf_rsocket_data, tvb, offset, data_len,
                         ENC_BIG_ENDIAN);
@@ -444,92 +479,102 @@ static int dissect_rsocket(tvbuff_t *tvb, packet_info *pinfo,
 void proto_register_rsocket(void) {
   static hf_register_info hf[] = {
       {&hf_rsocket_frame_len,
-       {"Frame Length", "rsocket.frame_len", FT_UINT24, BASE_DEC, NULL, 0x0,
-        NULL, HFILL}},
+          {"Frame Length", "rsocket.frame_len", FT_UINT24, BASE_DEC, NULL, 0x0,
+                                                                                                      NULL, HFILL}},
       {&hf_rsocket_stream_id,
-       {"Stream ID", "rsocket.stream_id", FT_UINT32, BASE_DEC, NULL, 0x0, NULL,
-        HFILL}},
+          {"Stream ID", "rsocket.stream_id", FT_UINT32, BASE_DEC, NULL, 0x0, NULL,
+                                                                                                            HFILL}},
       {&hf_rsocket_frame_type,
-       {"Frame Type", "rsocket.frame_type", FT_UINT8, BASE_DEC,
-        VALS(frameTypeNames), 0x0, NULL, HFILL}},
+          {"Frame Type", "rsocket.frame_type", FT_UINT8, BASE_DEC,
+              VALS(frameTypeNames), 0x0, NULL, HFILL}},
       {&hf_rsocket_mdata_len,
-       {"Metadata Length", "rsocket.metadata_len", FT_UINT24, BASE_DEC, NULL,
-        0x0, NULL, HFILL}},
+          {"Metadata Length", "rsocket.metadata_len", FT_UINT24, BASE_DEC, NULL,
+              0x0, NULL, HFILL}},
       {&hf_rsocket_mdata,
-       {"Metadata", "rsocket.metadata", FT_STRING, STR_ASCII, NULL, 0x0, NULL,
-        HFILL}},
+          {"Metadata", "rsocket.metadata", FT_STRING, STR_ASCII, NULL, 0x0, NULL,
+                                                                                                            HFILL}},
       {&hf_rsocket_data,
-       {"Data", "rsocket.data", FT_STRING, STR_ASCII, NULL, 0x0, NULL, HFILL}},
+          {"Data", "rsocket.data", FT_STRING, STR_ASCII, NULL, 0x0, NULL, HFILL}},
       {&hf_rsocket_ignore_flag,
-       {"Ignore", "rsocket.flags.ignore", FT_BOOLEAN, 16, NULL, 0x0200, NULL,
-        HFILL}},
+          {"Ignore", "rsocket.flags.ignore", FT_BOOLEAN, 16, NULL, 0x0200, NULL,
+                                                                                                            HFILL}},
       {&hf_rsocket_metadata_flag,
-       {"Metadata", "rsocket.flags.metadata", FT_BOOLEAN, 16, NULL, 0x0100,
-        NULL, HFILL}},
+          {"Metadata", "rsocket.flags.metadata", FT_BOOLEAN, 16, NULL, 0x0100,
+                                                                                                      NULL, HFILL}},
       {&hf_rsocket_resume_flag,
-       {"Resume", "rsocket.flags.resume", FT_BOOLEAN, 16, NULL, 0x0080, NULL,
-        HFILL}},
+          {"Resume", "rsocket.flags.resume", FT_BOOLEAN, 16, NULL, 0x0080, NULL,
+                                                                                                            HFILL}},
       {&hf_rsocket_lease_flag,
-       {"Lease", "rsocket.flags.lease", FT_BOOLEAN, 16, NULL, 0x0040, NULL,
-        HFILL}},
+          {"Lease", "rsocket.flags.lease", FT_BOOLEAN, 16, NULL, 0x0040, NULL,
+                                                                                                            HFILL}},
       {&hf_rsocket_follows_flag,
-       {"Follows", "rsocket.flags.follows", FT_BOOLEAN, 16, NULL, 0x0080, NULL,
-        HFILL}},
+          {"Follows", "rsocket.flags.follows", FT_BOOLEAN, 16, NULL, 0x0080, NULL,
+                                                                                                            HFILL}},
       {&hf_rsocket_complete_flag,
-       {"Complete", "rsocket.flags.complete", FT_BOOLEAN, 16, NULL, 0x0040,
-        NULL, HFILL}},
+          {"Complete", "rsocket.flags.complete", FT_BOOLEAN, 16, NULL, 0x0040,
+                                                                                                      NULL, HFILL}},
       {&hf_rsocket_next_flag,
-       {"Next", "rsocket.flags.next", FT_BOOLEAN, 16, NULL, 0x0020, NULL,
-        HFILL}},
+          {"Next", "rsocket.flags.next", FT_BOOLEAN, 16, NULL, 0x0020, NULL,
+                                                                                                            HFILL}},
       {&hf_rsocket_respond_flag,
-       {"Respond", "rsocket.flags.respond", FT_BOOLEAN, 16, NULL, 0x0080, NULL,
-        HFILL}},
+          {"Respond", "rsocket.flags.respond", FT_BOOLEAN, 16, NULL, 0x0080, NULL,
+                                                                                                            HFILL}},
       {&hf_rsocket_major_version,
-       {"Major Version", "rsocket.version.major", FT_UINT16, BASE_DEC, NULL,
-        0x0, NULL, HFILL}},
+          {"Major Version", "rsocket.version.major", FT_UINT16, BASE_DEC, NULL,
+              0x0, NULL, HFILL}},
       {&hf_rsocket_minor_version,
-       {"Minor Version", "rsocket.version.minor", FT_UINT16, BASE_DEC, NULL,
-        0x0, NULL, HFILL}},
+          {"Minor Version", "rsocket.version.minor", FT_UINT16, BASE_DEC, NULL,
+              0x0, NULL, HFILL}},
       {&hf_rsocket_keepalive_interval,
-       {"Keepalive Interval", "rsocket.keepalive.interval", FT_UINT32, BASE_DEC,
-        NULL, 0x0, NULL, HFILL}},
+          {"Keepalive Interval", "rsocket.keepalive.interval", FT_UINT32, BASE_DEC,
+              NULL, 0x0, NULL, HFILL}},
       {&hf_rsocket_max_lifetime,
-       {"Max Lifetime", "rsocket.max_lifetime", FT_UINT32, BASE_DEC, NULL, 0x0,
-        NULL, HFILL}},
+          {"Max Lifetime", "rsocket.max_lifetime", FT_UINT32, BASE_DEC, NULL, 0x0,
+                                                                                                      NULL, HFILL}},
       {&hf_rsocket_mdata_mime_length,
-       {"Metadata MIME Length", "rsocket.mdata_mime_length", FT_UINT8, BASE_DEC,
-        NULL, 0x0, NULL, HFILL}},
+          {"Metadata MIME Length", "rsocket.mdata_mime_length", FT_UINT8, BASE_DEC,
+              NULL, 0x0, NULL, HFILL}},
       {&hf_rsocket_mdata_mime_type,
-       {"Metadata MIME Type", "rsocket.mdata_mime_type", FT_STRING, STR_ASCII,
-        NULL, 0x0, NULL, HFILL}},
+          {"Metadata MIME Type", "rsocket.mdata_mime_type", FT_STRING, STR_ASCII,
+              NULL, 0x0, NULL, HFILL}},
       {&hf_rsocket_data_mime_length,
-       {"Data MIME Length", "rsocket.data_mime_length", FT_UINT8, BASE_DEC,
-        NULL, 0x0, NULL, HFILL}},
+          {"Data MIME Length", "rsocket.data_mime_length", FT_UINT8, BASE_DEC,
+              NULL, 0x0, NULL, HFILL}},
       {&hf_rsocket_data_mime_type,
-       {"Data MIME Type", "rsocket.data_mime_type", FT_STRING, STR_ASCII, NULL,
-        0x0, NULL, HFILL}},
+          {"Data MIME Type", "rsocket.data_mime_type", FT_STRING, STR_ASCII, NULL,
+              0x0, NULL, HFILL}},
       {&hf_rsocket_req_n,
-       {"Request N", "rsocket.request_n", FT_UINT32, BASE_DEC, NULL, 0x0, NULL,
-        HFILL}},
+          {"Request N", "rsocket.request_n", FT_UINT32, BASE_DEC, NULL, 0x0, NULL,
+                                                                                                            HFILL}},
       {&hf_rsocket_error_code,
-       {"Error Code", "rsocket.error_code", FT_UINT32, BASE_DEC,
-        VALS(errorCodeNames), 0x0, NULL, HFILL}},
+          {"Error Code", "rsocket.error_code", FT_UINT32, BASE_DEC,
+              VALS(errorCodeNames), 0x0, NULL, HFILL}},
       {&hf_rsocket_keepalive_last_rcvd_pos,
-       {"Keepalive Last Received Position",
-        "rsocket.keepalive_last_received_position", FT_UINT64, BASE_DEC, NULL,
-        0x0, NULL, HFILL}},
+          {"Keepalive Last Received Position",
+              "rsocket.keepalive_last_received_position", FT_UINT64, BASE_DEC, NULL,
+              0x0, NULL, HFILL}},
       {&hf_rsocket_resume_token_len,
-       {"Resume Token Length", "rsocket.resume.token.len", FT_UINT16, BASE_DEC,
-        NULL, 0x0, NULL, HFILL}},
+          {"Resume Token Length", "rsocket.resume.token.len", FT_UINT16, BASE_DEC,
+              NULL, 0x0, NULL, HFILL}},
       {&hf_rsocket_resume_token,
-       {"Resume Token", "rsocket.resume.token", FT_STRING, STR_ASCII, NULL, 0x0,
-        NULL, HFILL}},
+          {"Resume Token", "rsocket.resume.token", FT_STRING, STR_ASCII, NULL, 0x0,
+                                                                                                      NULL, HFILL}},
       {&hf_rsocket_composite_metadata_ext_flag,
-       {"Composite Metadata Extension", "rsocket.metadata.composite", FT_UINT32, BASE_HEX, NULL, 0x0,
-       NULL, HFILL}},
+          {"Composite Metadata Extension", "rsocket.metadata.composite", FT_UINT32, BASE_HEX, NULL, 0x0,
+                                                                                                      NULL, HFILL}},
+      {&hf_rsocket_composite_metadata_m_flag,
+          {"M flag", "rsocket.composite_m_flag", FT_UINT8, BASE_NONE, VALS(m_flag_true_false), 0x080, NULL, HFILL}},
+      {&hf_rsocket_composite_meta_mime_id,
+          {"Mime id", "rsocket.composite_mimeid", FT_UINT8, BASE_HEX, VALS(mimeTypeIds) , 0x07F, NULL, HFILL}},
+      {&hf_rsocket_composite_meta_encoding_mime_type,
+          { "Metadata Encoding MIME Type", "rsocket.composite_encoding", FT_UINT8, BASE_HEX, NULL, 0x0, "Encoding mime type", HFILL}},
+      {&hf_rsocket_composite_meta_length,
+          {"Payload Length", "rsocket.composite_length", FT_UINT16, BASE_DEC, NULL, 0x0, NULL, HFILL}},
+      {&hf_rsocket_composite_meta_payload,
+          {"Payload Data", "rsocket.composite_payload", FT_STRING, STR_ASCII, NULL, 0x0, NULL, HFILL}},
   };
 
-  static gint *ett[] = {&ett_rsocket, &ett_rframe};
+  static gint *ett[] = {&ett_rsocket, &ett_rframe, &ett_compExt};
 
   proto_rsocket = proto_register_protocol("RSocket Protocol", /* name       */
                                           "RSocket",          /* short name */
@@ -542,49 +587,49 @@ void proto_register_rsocket(void) {
   expert_module_t *expert_rsocket;
   expert_rsocket = expert_register_protocol(proto_rsocket);
   static ei_register_info ei[] = {
-      {&ei_rsocket_frame_len_mismatch,
-       {"rsocket.frame_len.mismatch", PI_MALFORMED, PI_ERROR,
-        "Frame Length is wrong", EXPFILL}},
+    {&ei_rsocket_frame_len_mismatch,
+    {"rsocket.frame_len.mismatch", PI_MALFORMED, PI_ERROR,
+     "Frame Length is wrong", EXPFILL}},
   };
   expert_register_field_array(expert_rsocket, ei, array_length(ei));
 
   //Register in preferences
-   module_t *rsocket_module = prefs_register_protocol(proto_rsocket, proto_reg_handoff_rsocket);
+  module_t *rsocket_module = prefs_register_protocol(proto_rsocket, proto_reg_handoff_rsocket);
 
-   prefs_register_uint_preference(rsocket_module, "tcp.port",
-                                   "TCP port", "Decode directly over TCP. Set to \"0\" to disable.", 10, &prefs_rsocket_tcp_port);
+  prefs_register_uint_preference(rsocket_module, "tcp.port",
+                                 "TCP port", "Decode directly over TCP. Set to \"0\" to disable.", 10, &prefs_rsocket_tcp_port);
 
-   prefs_register_uint_preference(rsocket_module, "ws.port",
-                                   "Websocket port", "Decode as websocket over TCP. Set to \"0\" to disable.", 10, &prefs_rsocket_websocket_port);
+  prefs_register_uint_preference(rsocket_module, "ws.port",
+                                 "Websocket port", "Decode as websocket over TCP. Set to \"0\" to disable.", 10, &prefs_rsocket_websocket_port);
 
-   prefs_register_static_text_preference(rsocket_module,"warning.text","Warning: TCP and websocket port must be different.","" );
+  prefs_register_static_text_preference(rsocket_module,"warning.text","Warning: TCP and websocket port must be different.","" );
 }
 
 void proto_reg_handoff_rsocket(void) {
 
-    static gboolean prefs_initialized = FALSE;
-    static dissector_handle_t rsocket_handle, websocket_handle;
-    static guint current_tcp_port, current_websocket_port;
+  static gboolean prefs_initialized = FALSE;
+  static dissector_handle_t rsocket_handle, websocket_handle;
+  static guint current_tcp_port, current_websocket_port;
 
-    rsocket_handle = create_dissector_handle(frame_length_field_dissector, proto_rsocket);
-    websocket_handle = create_dissector_handle(no_frame_length_field_dissector, proto_rsocket);
+  rsocket_handle = create_dissector_handle(frame_length_field_dissector, proto_rsocket);
+  websocket_handle = create_dissector_handle(no_frame_length_field_dissector, proto_rsocket);
 
-    if (!prefs_initialized) {
-        dissector_add_uint("tcp.port", RSOCKET_TCP_PORT, rsocket_handle);
-        dissector_add_uint("ws.port", RSOCKET_WEBSOCKET_PORT, websocket_handle);
-        prefs_initialized = TRUE;
-    }
-    else {
-        dissector_delete_uint("tcp.port", current_tcp_port, rsocket_handle);
-        dissector_delete_uint("ws.port", current_websocket_port, websocket_handle);
-    }
-    if(RSOCKET_TCP_PORT!=0) {
-        dissector_add_uint("tcp.port", prefs_rsocket_tcp_port, rsocket_handle);
-    }
-    if(RSOCKET_WEBSOCKET_PORT!=0) {
-        dissector_add_uint("ws.port", prefs_rsocket_websocket_port, websocket_handle);
-    }
+  if (!prefs_initialized) {
+    dissector_add_uint("tcp.port", RSOCKET_TCP_PORT, rsocket_handle);
+    dissector_add_uint("ws.port", RSOCKET_WEBSOCKET_PORT, websocket_handle);
+    prefs_initialized = TRUE;
+  }
+  else {
+    dissector_delete_uint("tcp.port", current_tcp_port, rsocket_handle);
+    dissector_delete_uint("ws.port", current_websocket_port, websocket_handle);
+  }
+  if(RSOCKET_TCP_PORT!=0) {
+    dissector_add_uint("tcp.port", prefs_rsocket_tcp_port, rsocket_handle);
+  }
+  if(RSOCKET_WEBSOCKET_PORT!=0) {
+    dissector_add_uint("ws.port", prefs_rsocket_websocket_port, websocket_handle);
+  }
 
-    current_tcp_port =  prefs_rsocket_tcp_port;
-    current_websocket_port = prefs_rsocket_websocket_port;
+  current_tcp_port =  prefs_rsocket_tcp_port;
+  current_websocket_port = prefs_rsocket_websocket_port;
 }
