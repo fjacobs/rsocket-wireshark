@@ -28,6 +28,7 @@
 #include <epan/expert.h>
 #include <epan/packet.h>
 #include <epan/prefs.h>
+#include <stdio.h>
 
 #define RSOCKET_TCP_PORT 9898  /* Not IANA registered */
 #define RSOCKET_WEBSOCKET_PORT 9897  /* Not IANA registered */
@@ -65,6 +66,7 @@ static int hf_rsocket_follows_flag = -1;
 static int hf_rsocket_complete_flag = -1;
 static int hf_rsocket_next_flag = -1;
 static int hf_rsocket_respond_flag = -1;
+static int hf_rsocket_composite_metadata_ext_flag = -1;
 
 static gint ett_rsocket = -1;
 static gint ett_rframe = -1;
@@ -101,6 +103,20 @@ static const value_string errorCodeNames[] = {
     {0x00000202, "REJECTED"},          {0x00000203, "CANCELED"},
     {0x00000204, "INVALID"},           {0xFFFFFFFF, "REJECTED"}};
 
+static const value_string mimeTypeIds[] = {
+        {  0x7E, "message/x.rsocket.routing.v0 " },
+        {  0,       NULL }
+};
+
+typedef enum composite_metadata_extension {
+    COMPOSITE_METADATA_EXTENSION = 0
+} comp_meta_t;
+
+/* this is a guide to the current conversation state */
+struct rsocket_conversation_data {
+    comp_meta_t state;
+};
+
 static const gchar *getFrameTypeName(const guint64 frame_type) {
   for (unsigned long i = 0; i < sizeof(frameTypeNames) / sizeof(value_string);
        i++) {
@@ -111,7 +127,7 @@ static const gchar *getFrameTypeName(const guint64 frame_type) {
   return NULL;
 }
 
-static gint read_rsocket_setup_frame(proto_tree *tree, tvbuff_t *tvb,
+static gint read_rsocket_setup_frame(packet_info *pinfo, proto_tree *tree, tvbuff_t *tvb,
                                      gint offset) {
 
   gint8 resume_flag = tvb_get_bits8(tvb, (offset + 1) * 8, 1);
@@ -153,6 +169,26 @@ static gint read_rsocket_setup_frame(proto_tree *tree, tvbuff_t *tvb,
   offset += 1;
   proto_tree_add_item(tree, hf_rsocket_mdata_mime_type, tvb, offset,
                       mdata_mime_length, ENC_BIG_ENDIAN);
+
+    guint8 *param_name = tvb_get_string_enc(wmem_packet_scope(), tvb, offset,
+                                            mdata_mime_length,
+                                            ENC_UTF_8|ENC_NA);
+
+   if( !strcmp(param_name, "message/x.rsocket.composite-metadata.v0") ) {
+       g_warning("Found composite metadata = %s !!!!!", param_name);
+       //Remember this for the next initialisation frame..
+       struct conversation* convo =  conversation_new(0, &pinfo->src, NULL, ENDPOINT_TCP, 9897, 0, NO_ADDR2 );
+
+       struct rsocket_conversation_data	*conversation_data;
+       conversation_data = conversation_get_proto_data(convo, proto_rsocket);
+
+       if (conversation_data == NULL) {
+           conversation_data = g_malloc(sizeof(struct rsocket_conversation_data));
+           conversation_data->state = COMPOSITE_METADATA_EXTENSION;
+           conversation_add_proto_data(convo, proto_rsocket, conversation_data);
+       }
+   }
+
   offset += mdata_mime_length;
 
   guint data_mime_length;
@@ -162,7 +198,6 @@ static gint read_rsocket_setup_frame(proto_tree *tree, tvbuff_t *tvb,
   proto_tree_add_item(tree, hf_rsocket_data_mime_type, tvb, offset,
                       data_mime_length, ENC_BIG_ENDIAN);
   offset += data_mime_length;
-
   return offset;
 }
 
@@ -333,18 +368,25 @@ static int dissect_rsocket(tvbuff_t *tvb, packet_info *pinfo,
     col_add_str(pinfo->cinfo, COL_INFO, "UNDEFINED");
   }
 
+  //Indicates a frame type that initiates interactions (TODO: refactor)
+  gboolean initialization_frame_flag = FALSE;
+
   if (frame_type == 0x01) {
-    offset = read_rsocket_setup_frame(rframe_tree, tvb, offset);
+    offset = read_rsocket_setup_frame(pinfo, rframe_tree, tvb, offset);
   } else if (frame_type == 0x03) {
     offset = read_rsocket_keepalive_frame(rframe_tree, tvb, offset);
   } else if (frame_type == 0x04) {
     offset = read_rsocket_req_resp_frame(rframe_tree, tvb, offset);
+      initialization_frame_flag = TRUE;
   } else if (frame_type == 0x05) {
     offset = read_rsocket_fnf_frame(rframe_tree, tvb, offset);
+      initialization_frame_flag = TRUE;
   } else if (frame_type == 0x06) {
     offset = read_rsocket_req_stream_frame(pinfo, rframe_tree, tvb, offset);
+      initialization_frame_flag = TRUE;
   } else if (frame_type == 0x07) {
     offset = read_rsocket_req_channel_frame(rframe_tree, tvb, offset);
+      initialization_frame_flag = TRUE;
   } else if (frame_type == 0x08) {
     offset = read_rsocket_req_n_frame(pinfo, rframe_tree, tvb, offset);
   } else if (frame_type == 0x09) {
@@ -361,9 +403,24 @@ static int dissect_rsocket(tvbuff_t *tvb, packet_info *pinfo,
     guint32 mdata_len;
     proto_tree_add_item_ret_uint(rframe_tree, hf_rsocket_mdata_len, tvb, offset,
                                  3, ENC_BIG_ENDIAN, &mdata_len);
-    offset += 3;
-    proto_tree_add_item(rframe_tree, hf_rsocket_mdata, tvb, offset, mdata_len,
-                        ENC_BIG_ENDIAN);
+
+    struct conversation  *convo = find_conversation(0, &pinfo->src, NULL, ENDPOINT_TCP, 9897, 0, NO_ADDR2);
+    struct rsocket_conversation_data *conversation_data;
+
+    conversation_data = conversation_get_proto_data(convo, proto_rsocket);
+
+    if( (mdata_len!=0) && (initialization_frame_flag) && (conversation_data->state == COMPOSITE_METADATA_EXTENSION  ) )
+    { // then dissect: hf_rsocket_composite_metadata_ext_flag
+      g_warning("Found composite metadata extension");
+      //TODO: Dissect Composite metadata
+      // proto_tree_add_item(rframe_tree, hf_rsocket_composite_metadata_ext_flag, tvb, offset, 1, ENC_BIG_ENDIAN);
+      // conversation_delete_proto_data(convo, proto_rsocket);
+    } else {
+        g_warning("Dit not find compose extension");
+        offset += 3;
+        proto_tree_add_item(rframe_tree, hf_rsocket_mdata, tvb, offset, mdata_len,
+                            ENC_BIG_ENDIAN);
+    }
     offset += mdata_len;
     col_append_fstr(pinfo->cinfo, COL_INFO, " MetadataLen=%d", mdata_len);
   }
@@ -467,6 +524,9 @@ void proto_register_rsocket(void) {
       {&hf_rsocket_resume_token,
        {"Resume Token", "rsocket.resume.token", FT_STRING, STR_ASCII, NULL, 0x0,
         NULL, HFILL}},
+      {&hf_rsocket_composite_metadata_ext_flag,
+       {"Composite Metadata Extension", "rsocket.metadata.composite", FT_UINT32, BASE_HEX, NULL, 0x0,
+       NULL, HFILL}},
   };
 
   static gint *ett[] = {&ett_rsocket, &ett_rframe};
