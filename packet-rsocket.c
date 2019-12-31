@@ -66,10 +66,17 @@ static int hf_rsocket_follows_flag = -1;
 static int hf_rsocket_complete_flag = -1;
 static int hf_rsocket_next_flag = -1;
 static int hf_rsocket_respond_flag = -1;
+
 static int hf_rsocket_composite_metadata_ext_flag = -1;
+static int hf_rsocket_composite_metadata_m_flag = -1;
+static int hf_rsocket_composite_meta_mime_id = -1;
+static int hf_rsocket_composite_meta_encoding_mime_type = -1;
+static int hf_rsocket_composite_meta_length = -1;
+static int hf_rsocket_composite_meta_payload = -1;
 
 static gint ett_rsocket = -1;
 static gint ett_rframe = -1;
+static gint ett_compExt = -1;
 
 static gint frame_len_field_size = 3;
 
@@ -103,12 +110,18 @@ static const value_string errorCodeNames[] = {
     {0x00000202, "REJECTED"},          {0x00000203, "CANCELED"},
     {0x00000204, "INVALID"},           {0xFFFFFFFF, "REJECTED"}};
 
+
+static const value_string m_flag_true_false[] ={
+        {0x01, "Set"},
+        {0x00, "Not set"}
+};
+
 static const value_string mimeTypeIds[] = {
-        {  0x7E, "message/x.rsocket.routing.v0 " },
+        {  0x7E, "message/x.rsocket.routing.v0" },
         {  0,       NULL }
 };
 
-typedef enum composite_metadata_extension {
+typedef enum setup_state {
     COMPOSITE_METADATA_EXTENSION = 0
 } comp_meta_t;
 
@@ -116,6 +129,7 @@ typedef enum composite_metadata_extension {
 struct rsocket_conversation_data {
     comp_meta_t state;
 };
+
 
 static const gchar *getFrameTypeName(const guint64 frame_type) {
   for (unsigned long i = 0; i < sizeof(frameTypeNames) / sizeof(value_string);
@@ -171,15 +185,14 @@ static gint read_rsocket_setup_frame(packet_info *pinfo, proto_tree *tree, tvbuf
                       mdata_mime_length, ENC_BIG_ENDIAN);
 
     guint8 *param_name = tvb_get_string_enc(wmem_packet_scope(), tvb, offset,
-                                            mdata_mime_length,
-                                            ENC_UTF_8|ENC_NA);
+                                            mdata_mime_length,ENC_UTF_8|ENC_NA);
 
    if( !strcmp(param_name, "message/x.rsocket.composite-metadata.v0") ) {
-       g_warning("Found composite metadata = %s !!!!!", param_name);
-       //Remember this for the next initialisation frame..
-       struct conversation* convo =  conversation_new(0, &pinfo->src, NULL, ENDPOINT_TCP, 9897, 0, NO_ADDR2 );
 
+       struct conversation* convo =  conversation_new(0, &pinfo->src, NULL,
+                                                      ENDPOINT_TCP, 9897, 0, NO_ADDR2 );
        struct rsocket_conversation_data	*conversation_data;
+
        conversation_data = conversation_get_proto_data(convo, proto_rsocket);
 
        if (conversation_data == NULL) {
@@ -368,7 +381,7 @@ static int dissect_rsocket(tvbuff_t *tvb, packet_info *pinfo,
     col_add_str(pinfo->cinfo, COL_INFO, "UNDEFINED");
   }
 
-  //Indicates a frame type that initiates interactions (TODO: refactor)
+  //Indicates a frame type that initiates interactions (TODO: refactor into conversation)
   gboolean initialization_frame_flag = FALSE;
 
   if (frame_type == 0x01) {
@@ -377,16 +390,16 @@ static int dissect_rsocket(tvbuff_t *tvb, packet_info *pinfo,
     offset = read_rsocket_keepalive_frame(rframe_tree, tvb, offset);
   } else if (frame_type == 0x04) {
     offset = read_rsocket_req_resp_frame(rframe_tree, tvb, offset);
-      initialization_frame_flag = TRUE;
+    initialization_frame_flag = TRUE;
   } else if (frame_type == 0x05) {
     offset = read_rsocket_fnf_frame(rframe_tree, tvb, offset);
-      initialization_frame_flag = TRUE;
+    initialization_frame_flag = TRUE;
   } else if (frame_type == 0x06) {
     offset = read_rsocket_req_stream_frame(pinfo, rframe_tree, tvb, offset);
-      initialization_frame_flag = TRUE;
+    initialization_frame_flag = TRUE;
   } else if (frame_type == 0x07) {
     offset = read_rsocket_req_channel_frame(rframe_tree, tvb, offset);
-      initialization_frame_flag = TRUE;
+    initialization_frame_flag = TRUE;
   } else if (frame_type == 0x08) {
     offset = read_rsocket_req_n_frame(pinfo, rframe_tree, tvb, offset);
   } else if (frame_type == 0x09) {
@@ -403,29 +416,50 @@ static int dissect_rsocket(tvbuff_t *tvb, packet_info *pinfo,
     guint32 mdata_len;
     proto_tree_add_item_ret_uint(rframe_tree, hf_rsocket_mdata_len, tvb, offset,
                                  3, ENC_BIG_ENDIAN, &mdata_len);
+    offset += 3;
+                                                                                            //TODO: get port from pinfo
+    struct conversation  *convo = find_conversation(0, &pinfo->src, NULL, ENDPOINT_TCP,
+                                                                                         9897, 0, NO_ADDR2);
 
-    struct conversation  *convo = find_conversation(0, &pinfo->src, NULL, ENDPOINT_TCP, 9897, 0, NO_ADDR2);
     struct rsocket_conversation_data *conversation_data;
-
     conversation_data = conversation_get_proto_data(convo, proto_rsocket);
 
-    if( (mdata_len!=0) && (initialization_frame_flag) && (conversation_data->state == COMPOSITE_METADATA_EXTENSION  ) )
-    { // then dissect: hf_rsocket_composite_metadata_ext_flag
-      g_warning("Found composite metadata extension");
-      //TODO: Dissect Composite metadata
-      // proto_tree_add_item(rframe_tree, hf_rsocket_composite_metadata_ext_flag, tvb, offset, 1, ENC_BIG_ENDIAN);
-      // conversation_delete_proto_data(convo, proto_rsocket);
+    if( (mdata_len!=0) && (initialization_frame_flag) && (conversation_data->state == COMPOSITE_METADATA_EXTENSION  ) ) {
+
+        proto_item *compExt;
+        proto_tree *compExt_tree = proto_tree_add_subtree(
+                rframe_tree, tvb, offset, mdata_len, ett_compExt, &compExt, "Composite Metadata Extension");
+
+        guint32 val;
+        proto_tree_add_item_ret_uint(compExt_tree, hf_rsocket_composite_metadata_m_flag,
+                                                                     tvb, offset,1, ENC_BIG_ENDIAN, &val);
+        proto_tree_add_item(compExt_tree, hf_rsocket_composite_meta_mime_id, tvb, offset,1, ENC_NA);
+        offset+=4;
+        guint32 mPayloadLength;
+        proto_tree_add_item_ret_uint(compExt_tree, hf_rsocket_composite_meta_length, tvb, offset,
+                                                                       1, ENC_BIG_ENDIAN, &mPayloadLength);
+        offset += 1;
+        proto_tree_add_item(compExt_tree, hf_rsocket_composite_meta_payload, tvb, offset, mPayloadLength, ENC_BIG_ENDIAN);
+        offset -= 5;
     } else {
-        g_warning("Dit not find compose extension");
         offset += 3;
-        proto_tree_add_item(rframe_tree, hf_rsocket_mdata, tvb, offset, mdata_len,
-                            ENC_BIG_ENDIAN);
+        proto_tree_add_item(rframe_tree, hf_rsocket_mdata, tvb, offset, mdata_len, ENC_BIG_ENDIAN);
     }
     offset += mdata_len;
     col_append_fstr(pinfo->cinfo, COL_INFO, " MetadataLen=%d", mdata_len);
   }
 
-  guint32 data_len = frame_len + frame_length_field_size - offset;
+
+    guint32 data_len = frame_len + frame_length_field_size - offset;
+
+    g_warning("\n\n\n-----------------------------------------------------");
+    g_warning("initialization_frame_flag: %i\n", initialization_frame_flag);
+    g_warning("---------framelen: %i", frame_len);
+    g_warning("---------frame_length_field_size: %i", frame_length_field_size);
+    g_warning("---------offset: %i", offset);
+    g_warning("data_len: %i", data_len);
+    g_warning("-----------------------------------------------------\n\n\n");
+
   if (data_len > 0) {
     proto_tree_add_item(rframe_tree, hf_rsocket_data, tvb, offset, data_len,
                         ENC_BIG_ENDIAN);
@@ -527,9 +561,19 @@ void proto_register_rsocket(void) {
       {&hf_rsocket_composite_metadata_ext_flag,
        {"Composite Metadata Extension", "rsocket.metadata.composite", FT_UINT32, BASE_HEX, NULL, 0x0,
        NULL, HFILL}},
+      {&hf_rsocket_composite_metadata_m_flag,
+       {"M flag", "rsocket.composite_m_flag", FT_UINT8, BASE_NONE, VALS(m_flag_true_false), 0x080, NULL, HFILL}},
+      {&hf_rsocket_composite_meta_mime_id,
+       {"Mime id", "rsocket.composite_mimeid", FT_UINT8, BASE_HEX, VALS(mimeTypeIds) , 0x07F, NULL, HFILL}},
+      {&hf_rsocket_composite_meta_encoding_mime_type,
+       { "Metadata Encoding MIME Type", "rsocket.composite_encoding", FT_UINT8, BASE_HEX, NULL, 0x0, "Encoding mime type", HFILL}},
+      {&hf_rsocket_composite_meta_length,
+       {"Payload Length", "rsocket.composite_length", FT_UINT16, BASE_DEC, NULL, 0x0, NULL, HFILL}},
+      {&hf_rsocket_composite_meta_payload,
+       {"Payload Data", "rsocket.composite_payload", FT_STRING, STR_ASCII, NULL, 0x0, NULL, HFILL}},
   };
 
-  static gint *ett[] = {&ett_rsocket, &ett_rframe};
+  static gint *ett[] = {&ett_rsocket, &ett_rframe, &ett_compExt};
 
   proto_rsocket = proto_register_protocol("RSocket Protocol", /* name       */
                                           "RSocket",          /* short name */
